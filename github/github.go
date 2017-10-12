@@ -23,33 +23,53 @@ func NewClient(username, token string) Github {
 	return Github{username, token}
 }
 
-func (gh Github) GetAllRepos(org string) (repos []GHRepo, err error) {
-	req, err := http.NewRequest("GET", "https://api.github.com/orgs/"+org+"/repos", nil)
+func (gh Github) GetRepo(org, repoName string) (repo GHRepo, err error) {
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/"+org+"/"+repoName, nil)
 	if err != nil {
 		return
 	}
 	req.SetBasicAuth(gh.username, gh.token)
 
-	n, _, repos, err := getRepoPage(req)
+	res, err := c.Do(req)
+	if err != nil {
+		return
+	}
+
+	b, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return
+	}
+
+	err = json.Unmarshal(b, &repo)
+	return
+}
+
+func (gh Github) GetAllRepos(org string) (repos []GHRepo, err error) {
+	var req *http.Request
+	next := "https://api.github.com/orgs/" + org + "/repos"
+	i := 1 // GH paginates starting at 1
+	repos = []GHRepo{}
+
 	for {
-		//fmt.Printf("next: %s, last: %s\n", n, l)
-		if n == "" {
+		if next == "" {
 			break
 		}
 
-		req, err = http.NewRequest("GET", n, nil)
+		req, err = http.NewRequest("GET", next, nil)
 		if err != nil {
 			return
 		}
 		req.SetBasicAuth(gh.username, gh.token)
 
 		var repoPage []GHRepo
-		n, _, repoPage, err = getRepoPage(req)
+		next, _, repoPage, err = getRepoPage(req)
 		if err != nil {
+			err = fmt.Errorf("Error getting page %d of repo list: %s", i, err.Error())
 			return
 		}
 
 		repos = append(repos, repoPage...)
+		i++
 	}
 
 	return
@@ -62,8 +82,10 @@ func getRepoPage(req *http.Request) (next, last string, repos []GHRepo, err erro
 	if err != nil {
 		return
 	}
-
-	//fmt.Printf("Got %s\n", res.Status)
+	if res.StatusCode != 200 {
+		err = fmt.Errorf("Got %s", res.Status)
+		return
+	}
 
 	lh := res.Header[http.CanonicalHeaderKey("link")]
 	links := make(map[string]string)
@@ -71,7 +93,7 @@ func getRepoPage(req *http.Request) (next, last string, repos []GHRepo, err erro
 	for _, l := range lh {
 		sm := linkMatcher.FindAllStringSubmatch(l, -1)
 		for _, m := range sm {
-			// links["next"] = "http://api.github.com/orgs/metamx/repos?page=2"
+			// links["next"] = "http://api.github.com/orgs/MYCOOLORGANIZATION/repos?page=2"
 			links[m[2]] = m[1]
 		}
 	}
@@ -92,11 +114,6 @@ func getRepoPage(req *http.Request) (next, last string, repos []GHRepo, err erro
 }
 
 func (gh Github) DownloadRepoArchive(repo GHRepo, archiveFormat GHArchiveFormat, ref string) error {
-	of, err := os.OpenFile(repo.Name+"_"+repo.DefaultBranch+archiveFormatFileEx[archiveFormat], os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-
 	t, err := uritemplates.Parse(repo.ArchiveUrl)
 	if err != nil {
 		return err
@@ -110,21 +127,36 @@ func (gh Github) DownloadRepoArchive(repo GHRepo, archiveFormat GHArchiveFormat,
 		return err
 	}
 
+	localFileName := repo.Name + "_" + repo.DefaultBranch + archiveFormatFileEx[archiveFormat]
+	of, err := os.OpenFile(localFileName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		of.Close()
+		return err
+	}
+
 	req, err := http.NewRequest("GET", ex, nil)
 	if err != nil {
-		panic(err)
+		of.Close()
+		os.Remove(localFileName)
+		return err
 	}
 	req.SetBasicAuth(gh.username, gh.token)
 
-	res, err := http.DefaultClient.Do(req) // use DefaultClient since it has no timeouts and downloads may take awhile
+	// use http.DefaultClient since it has no timeouts and downloads may take awhile
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
+		of.Close()
+		os.Remove(localFileName)
 		return err
 	}
 
 	if res.StatusCode != 200 {
+		of.Close()
+		os.Remove(localFileName)
 		return fmt.Errorf("Got %s!", res.Status)
 	}
 
 	_, err = io.Copy(of, res.Body)
+	of.Close()
 	return err
 }
